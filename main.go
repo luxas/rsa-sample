@@ -1,23 +1,15 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"io"
-	"math"
+	"io/ioutil"
 	"math/big"
+	"math/rand"
 	"os"
-)
-
-var (
-	// Always needed
-	e    = flag.Int64("e", 0, "A number that satisfies 1 < e < m and sgd(e,m) = 1")
-	mode = flag.String("mode", "", "Either encrypt or decrypt")
-	// Required when decrypting
-	p = flag.Int64("p", 0, "One prime")
-	q = flag.Int64("q", 0, "An other prime")
-	// Required when encrypting
-	n = flag.Int64("n", 0, "The public key, p * q")
+	"strconv"
+	"strings"
+	"time"
 )
 
 func main() {
@@ -28,58 +20,111 @@ func main() {
 }
 
 func run() error {
-	flag.Parse()
-	var err error
-	var reader io.Reader
-	var writer io.Writer
-	if *mode == "encrypt" {
-		if *e <= 0 || *n <= 0 {
-			return fmt.Errorf("arguments n, and e are required")
-		}
-		file, err := os.Open("file.txt")
-		if err != nil {
-			return err
-		}
-		defer file.Close()
-		reader = file
-		writer = NewRSAWriter(os.Stdout, *n, *e)
-	} else if *mode == "decrypt" {
-		if *e <= 0 || *p <= 0 || *q <= 0 {
-			return fmt.Errorf("arguments e, x, p and q are required")
-		}
-		file, err := os.Open("out.txt")
-		if err != nil {
-			return err
-		}
-		defer file.Close()
-		reader = NewRSAReader(file, *e, *p, *q)
-		writer = os.Stdout
-	} else {
-		return fmt.Errorf("mode must be either encrypt or decrypt")
+	if len(os.Args) < 2 || (os.Args[1] != "gen" && len(os.Args) < 3) {
+		return fmt.Errorf("Usage: rsa [gen|encrypt|decrypt] [filename]")
 	}
+
+	mode := os.Args[1]
+	if mode == "gen" {
+		return gen()
+	}
+
+	filename := os.Args[2]
+
+	file, err := os.Open(filename)
 	if err != nil {
 		return err
+	}
+	defer file.Close()
+
+	var reader io.Reader
+	var writer io.Writer
+	if mode == "encrypt" {
+		e, n, err := readKeyFile("public.key")
+		if err != nil {
+			return err
+		}
+		reader = file
+		writer = NewRSAWriter(os.Stdout, e, n)
+	} else if mode == "decrypt" {
+		d, n, err := readKeyFile("private.key")
+		if err != nil {
+			return err
+		}
+		reader = NewRSAReader(file, d, n)
+		writer = os.Stdout
+	} else {
+		return fmt.Errorf("mode must be gen, encrypt or decrypt")
 	}
 
 	// Read from the reader and stream the outputs through the writer
-	_, err = io.Copy(writer, reader)
-	if err != nil {
+	if _, err = io.Copy(writer, reader); err != nil {
 		return err
 	}
 	return nil
+}
+
+func gen() error {
+	rand.Seed(time.Now().Unix())
+	var p, q, e uint64
+	var pbig, qbig, nbig big.Int
+	for {
+		p = uint64(rand.Uint32())
+		q = uint64(rand.Uint32())
+		pbig, qbig = bigUint64(p), bigUint64(q)
+		if !pbig.ProbablyPrime(20) || !qbig.ProbablyPrime(20) {
+			continue
+		}
+
+		nbig.Mul(&pbig, &qbig)
+		if nbig.BitLen() == 64 {
+			break
+		}
+	}
+
+	var ebig, mbig, dbig, a, b, gcd big.Int
+
+	mbig.Mul((&big.Int{}).Sub(&pbig, big.NewInt(1)), (&big.Int{}).Sub(&qbig, big.NewInt(1)))
+
+	for {
+		e = uint64(rand.Uint32())
+		if !(3 <= e && e < mbig.Uint64()) {
+			continue
+		}
+		ebig = bigUint64(e)
+		gcd.GCD(&a, &b, &mbig, &ebig)
+		if gcd.Uint64() != 1 {
+			continue
+		}
+		if b.Int64() < 0 {
+			dbig.Add(&b, &mbig)
+		} else {
+			dbig.Set(&b)
+		}
+		break
+	}
+	//fmt.Printf("p=%d, q=%d, n=%d, m=%d, e=%d, d=%d\n", p, q, nbig.Uint64(), mbig.Uint64(), e, dbig.Uint64())
+	if err := ioutil.WriteFile("public.key", []byte(fmt.Sprintf("%d,%d", e, nbig.Uint64())), 0644); err != nil {
+		return err
+	}
+	return ioutil.WriteFile("private.key", []byte(fmt.Sprintf("%d,%d", dbig.Uint64(), nbig.Uint64())), 0644)
 }
 
 // RSAWriter implements the io.Writer interface
 var _ io.Writer = &RSAWriter{}
 
 // NewRSAWriter creates a new RSA writer
-func NewRSAWriter(w io.Writer, n, e int64) *RSAWriter {
-	nbig := big.NewInt(n)
+func NewRSAWriter(w io.Writer, e, n uint64) *RSAWriter {
+	nbig, ebig := bigUint64(n), bigUint64(e)
+	bytes := uint64(nbig.BitLen() / 8)
+	if bytes < 1 {
+		bytes = 1
+	}
 	return &RSAWriter{
 		w:     w,
-		n:     nbig,
-		e:     big.NewInt(e),
-		bytes: uint64(nbig.BitLen() / 8),
+		n:     &nbig,
+		e:     &ebig,
+		bytes: bytes,
 	}
 }
 
@@ -91,20 +136,17 @@ type RSAWriter struct {
 }
 
 func (w *RSAWriter) Write(p []byte) (n int, err error) {
-	var stop bool
+	var buf []byte
+	var upper int
 	for {
-		plain := make([]byte, w.bytes)
-		for j := 0; j < int(w.bytes); j++ {
-			plain = append(plain, p[n])
-			n++
-			if n == len(p) {
-				stop = true
-				break
-			}
+		upper = n + int(w.bytes)
+		if upper > len(p) {
+			upper = len(p)
 		}
-		encrypted := w.encrypt(plain)
-		_, err = w.w.Write(encrypted)
-		if stop {
+		buf = p[n:upper]
+		_, err = w.w.Write(w.encrypt(buf))
+		n = upper
+		if n == len(p) || err != nil {
 			break
 		}
 	}
@@ -115,8 +157,7 @@ func (w *RSAWriter) Write(p []byte) (n int, err error) {
 }
 
 func (w *RSAWriter) encrypt(x []byte) []byte {
-	i := &big.Int{}
-	i.SetBytes(x)
+	i := (&big.Int{}).SetBytes(x)
 	return powmod(i, w.e, w.n).Bytes()
 }
 
@@ -124,34 +165,25 @@ func (w *RSAWriter) encrypt(x []byte) []byte {
 var _ io.Reader = &RSAReader{}
 
 // NewRSAReader creates a new RSA reader
-func NewRSAReader(r io.Reader, e, p, q int64) *RSAReader {
-	n := p * q
-	m := (p - 1) * (q - 1)
-	_, d := euklides(m, e)
-
-	if d < 0 {
-		d += m
+func NewRSAReader(r io.Reader, d, n uint64) *RSAReader {
+	nbig, dbig := bigUint64(n), bigUint64(d)
+	bytes := uint64(nbig.BitLen() / 8)
+	if bytes < 1 {
+		bytes = 1
 	}
-
-	nbig := big.NewInt(n)
-
 	return &RSAReader{
 		r:     r,
-		e:     big.NewInt(e),
-		p:     big.NewInt(p),
-		q:     big.NewInt(q),
-		n:     nbig,
-		m:     big.NewInt(m),
-		d:     big.NewInt(d),
-		bytes: uint64(nbig.BitLen() / 8),
+		n:     &nbig,
+		d:     &dbig,
+		bytes: bytes,
 	}
 }
 
 // RSAReader wraps an io.Reader and decrypts using RSA
 type RSAReader struct {
-	r                io.Reader
-	e, p, q, n, m, d *big.Int
-	bytes            uint64
+	r     io.Reader
+	d, n  *big.Int
+	bytes uint64
 }
 
 func (r *RSAReader) Read(p []byte) (n int, err error) {
@@ -171,8 +203,7 @@ func (r *RSAReader) Read(p []byte) (n int, err error) {
 }
 
 func (r *RSAReader) decrypt(x []byte) []byte {
-	i := &big.Int{}
-	i.SetBytes(x)
+	i := (&big.Int{}).SetBytes(x)
 	return powmod(i, r.d, r.n).Bytes()
 }
 
@@ -180,35 +211,23 @@ func powmod(a, b, c *big.Int) *big.Int {
 	return (&big.Int{}).Exp(a, b, c)
 }
 
-type euk struct {
-	// r = 1 * x - b (stored here) * y
-	store []int64
+func bigUint64(val uint64) big.Int {
+	return *(&big.Int{}).SetUint64(val)
 }
 
-func euklides(tal, faktor int64) (int64, int64) {
-	e := euk{}
-	e.eukfn(tal, faktor)
-	a, b := int64(0), int64(0)
-	for i := len(e.store) - 1; i >= 0; i-- {
-		num := e.store[i]
-		if a == 0 && b == 0 {
-			a = 1
-			b = -num
-		} else {
-			newa := b
-			b = a + b*-num
-			a = newa
-		}
+func readKeyFile(filename string) (uint64, uint64, error) {
+	content, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return 0, 0, err
 	}
-	return a, b
-}
-
-func (e *euk) eukfn(tal, faktor int64) {
-	rest := int64(math.Mod(float64(tal), float64(faktor)))
-	num := int64(tal / faktor)
-	e.store = append(e.store, num)
-	if rest == 1 {
-		return
+	parts := strings.Split(string(content), ",")
+	a, err := strconv.ParseUint(parts[0], 10, 64)
+	if err != nil {
+		return 0, 0, err
 	}
-	e.eukfn(faktor, rest)
+	b, err := strconv.ParseUint(parts[1], 10, 64)
+	if err != nil {
+		return 0, 0, err
+	}
+	return a, b, nil
 }
